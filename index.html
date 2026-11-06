@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Thư viện PDF</title>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{--bg:#f6f6f4;--fg:#1c1c1c;--card:#fff;--ac:#2563eb;--bd:#ddd}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--card:#242424;--bd:#444}}
+*{box-sizing:border-box}body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+[hidden]{display:none!important}
+.box{max-width:480px;margin:auto;padding:20px}
+button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);cursor:pointer}
+button.p{background:var(--ac);color:#fff;border:0}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.book{display:flex;gap:8px;align-items:center;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin:8px 0}
+.book span{flex:1;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.book small{opacity:.6}
+#bar{position:sticky;top:0;z-index:9;display:flex;gap:6px;padding:8px;background:var(--card);border-bottom:1px solid var(--bd);align-items:center;flex-wrap:wrap}
+#bar button.on{background:var(--ac);color:#fff}
+#st{margin-left:auto;font-size:13px;opacity:.7}
+#pages{max-width:900px;margin:auto}
+.pg{position:relative;margin:8px auto;background:#fff;container-type:inline-size;box-shadow:0 1px 4px #0003}
+.pg canvas{display:block;width:100%;height:100%}
+.ov{position:absolute;inset:0}
+body.hl .ov{touch-action:none;cursor:crosshair}body.tx .ov{cursor:text}
+.h{position:absolute;background:rgba(255,230,0,.45);mix-blend-mode:multiply}
+.t{position:absolute;color:#d00;font-size:2.2cqw;line-height:1.2;white-space:pre-wrap;transform:translateY(-50%)}
+body.er .h,body.er .t{outline:2px dashed red;cursor:pointer}
+#busy{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#000c;color:#fff;padding:8px 14px;border-radius:20px;z-index:99}
+</style></head><body>
+
+<div id="auth" class="box">
+  <h2>Thư viện PDF</h2>
+  <p>Đăng nhập Google để dùng thư viện lưu trên Drive của bạn.</p>
+  <button class="p" onclick="login()">Đăng nhập Google</button>
+  <p id="msg"></p>
+</div>
+
+<div id="lib" class="box" hidden>
+  <h2>Sách của tôi</h2>
+  <div class="row"><input id="up" type="file" accept="application/pdf" multiple hidden>
+  <button class="p" onclick="up.click()">⬆ Tải PDF lên</button>
+  <button onclick="list()">↻ Làm mới</button><button onclick="logout()">Đăng xuất</button></div>
+  <div id="list"></div>
+</div>
+
+<div id="rd" hidden>
+  <div id="bar">
+    <button onclick="closeBook()">←</button>
+    <button data-t="view" class="on">Xem</button>
+    <button data-t="hl">Highlight</button>
+    <button data-t="tx">Chèn chữ</button>
+    <button data-t="er">Xóa</button>
+    <span id="st"></span>
+  </div>
+  <div id="pages"></div>
+</div>
+<div id="busy" hidden></div>
+
+<script>
+// ====== ĐIỀN CLIENT ID CỦA BẠN ======
+const CLIENT_ID='265300898548-a5eihfb4qgvo9bop72o68ec285rabopq.apps.googleusercontent.com';
+// ====================================
+const D='https://www.googleapis.com/drive/v3',U='https://www.googleapis.com/upload/drive/v3';
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const $=s=>document.querySelector(s);
+let tc,token=null,exp=0,book,pdf,ann={},t0=0,annId=null,timer;
+const busy=t=>{$('#busy').hidden=!t;$('#busy').textContent=t||''};
+
+// ---- Đăng nhập Google ----
+function tok(prompt=''){return new Promise((res,rej)=>{
+  if(token&&Date.now()<exp-60000)return res(token);
+  tc.callback=r=>{if(r.error)return rej(r);token=r.access_token;exp=Date.now()+r.expires_in*1000;localStorage.hasAuth=1;res(token)};
+  tc.error_callback=rej;tc.requestAccessToken({prompt});
+})}
+async function api(u,o={}){
+  const t=await tok();
+  const r=await fetch(u,{...o,headers:{...o.headers,Authorization:'Bearer '+t}});
+  if(r.status==401){token=null;return api(u,o)}
+  if(!r.ok)throw new Error(await r.text());return r;
+}
+async function login(){
+  try{await tok('select_account');enter()}catch(e){$('#msg').textContent='Đăng nhập thất bại: '+(e.error||e.type||e.message)}
+}
+function logout(){token=null;exp=0;delete localStorage.hasAuth;delete localStorage.fid;$('#lib').hidden=true;$('#auth').hidden=false}
+function enter(){$('#auth').hidden=true;$('#lib').hidden=false;list()}
+addEventListener('load',()=>{
+  const w=setInterval(()=>{if(!window.google?.accounts)return;clearInterval(w);
+    tc=google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/drive.file',callback:()=>{}});
+    if(localStorage.hasAuth)tok('none').then(enter).catch(()=>{});
+  },100);
+});
+
+// ---- Thư mục & danh sách ----
+async function folder(){
+  if(localStorage.fid)return localStorage.fid;
+  const q=encodeURIComponent("name='PDF Library' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+  let j=await(await api(`${D}/files?q=${q}&fields=files(id)`)).json(),id;
+  if(j.files[0])id=j.files[0].id;
+  else id=(await(await api(`${D}/files`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:'PDF Library',mimeType:'application/vnd.google-apps.folder'})})).json()).id;
+  return localStorage.fid=id;
+}
+async function list(){
+  busy('Đang tải danh sách…');
+  try{
+    const f=await folder(),q=encodeURIComponent(`'${f}' in parents and mimeType='application/pdf' and trashed=false`);
+    const j=await(await api(`${D}/files?q=${q}&orderBy=modifiedTime desc&pageSize=200&fields=files(id,name,size,modifiedTime)`)).json();
+    $('#list').innerHTML=j.files.length?'':'<p>Chưa có sách nào. Bấm “Tải PDF lên”.</p>';
+    j.files.forEach(b=>{
+      const d=document.createElement('div');d.className='book';
+      d.innerHTML='<span></span><small></small><button>🗑</button>';
+      d.children[0].textContent=b.name.replace(/\.pdf$/i,'');d.children[0].onclick=()=>openBook(b);
+      d.children[1].textContent=(b.size/1048576).toFixed(1)+' MB';
+      d.children[2].onclick=async()=>{if(!confirm('Xóa sách này khỏi Drive?'))return;
+        await api(`${D}/files/${b.id}`,{method:'DELETE'});list()};
+      $('#list').append(d);
+    });
+  }catch(e){alert('Lỗi: '+e.message)}
+  busy();
+}
+
+// ---- Tải lên (resumable, không giới hạn 50MB) ----
+$('#up').onchange=async e=>{
+  const f=await folder();
+  for(const file of e.target.files){
+    try{
+      busy('Đang tải lên '+file.name+'…');
+      const r=await api(`${U}/files?uploadType=resumable`,{method:'POST',
+        headers:{'Content-Type':'application/json','X-Upload-Content-Type':'application/pdf'},
+        body:JSON.stringify({name:file.name,parents:[f],mimeType:'application/pdf'})});
+      await fetch(r.headers.get('Location'),{method:'PUT',headers:{'Content-Type':'application/pdf'},body:file});
+    }catch(err){alert('Lỗi tải '+file.name+': '+err.message)}
+  }
+  e.target.value='';busy();list();
+};
+
+// ---- Đọc sách (có cache trong máy) ----
+async function getBuf(b){
+  const c=await caches.open('pdfs'),k=new Request('/'+b.id+'_'+b.modifiedTime);
+  let r=await c.match(k);
+  if(!r){busy('Đang tải sách về máy (lần đầu)…');
+    r=await api(`${D}/files/${b.id}?alt=media`);await c.put(k,r.clone())}
+  return r.arrayBuffer();
+}
+async function openBook(b){
+  book=b;$('#lib').hidden=true;$('#rd').hidden=false;$('#pages').innerHTML='';$('#st').textContent='Đang mở…';
+  try{
+    const loc=JSON.parse(localStorage['a'+b.id]||'null');ann=loc?.d||{};t0=loc?.t||0;annId=localStorage['i'+b.id]||null;
+    pdf=await pdfjsLib.getDocument({data:await getBuf(b)}).promise;busy();
+    await build();$('#st').textContent='';
+    syncDown();
+  }catch(e){busy();alert('Không mở được: '+e.message);closeBook()}
+}
+async function syncDown(){
+  try{
+    const f=await folder(),q=encodeURIComponent(`name='${book.id}.ann.json' and '${f}' in parents and trashed=false`);
+    const j=await(await api(`${D}/files?q=${q}&fields=files(id)`)).json();
+    if(!j.files[0])return;annId=j.files[0].id;localStorage['i'+book.id]=annId;
+    const r=await(await api(`${D}/files/${annId}?alt=media`)).json();
+    if(r.t>t0){ann=r.d;t0=r.t;localStorage['a'+book.id]=JSON.stringify({d:ann,t:t0});
+      document.querySelectorAll('.pg').forEach(draw)}
+  }catch(e){console.warn(e)}
+}
+async function closeBook(){await flush();book=null;pdf=null;$('#rd').hidden=true;$('#lib').hidden=false;list()}
+
+async function build(){
+  const w=$('#pages');
+  const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting&&!e.target.dataset.r){e.target.dataset.r=1;render(e.target)}}),{rootMargin:'600px'});
+  const v=(await pdf.getPage(1)).getViewport({scale:1});
+  for(let n=1;n<=pdf.numPages;n++){
+    const d=document.createElement('div');d.className='pg';d.dataset.n=n;
+    d.style.aspectRatio=v.width+'/'+v.height;w.append(d);io.observe(d);
+  }
+}
+async function render(d){
+  const n=+d.dataset.n,p=await pdf.getPage(n),v0=p.getViewport({scale:1});
+  const v=p.getViewport({scale:d.clientWidth/v0.width*Math.min(devicePixelRatio,2)});
+  d.style.aspectRatio=v0.width+'/'+v0.height;
+  const c=document.createElement('canvas');c.width=v.width;c.height=v.height;d.append(c);
+  const ov=document.createElement('div');ov.className='ov';d.append(ov);bind(d,ov,n);draw(d);
+  await p.render({canvasContext:c.getContext('2d'),viewport:v}).promise;
+}
+
+// ---- Chỉnh sửa ----
+document.querySelectorAll('#bar [data-t]').forEach(b=>b.onclick=()=>{
+  window.tool=b.dataset.t;document.body.className=tool=='view'?'':tool;
+  document.querySelectorAll('#bar [data-t]').forEach(x=>x.classList.toggle('on',x==b));
+});
+window.tool='view';
+function draw(d){
+  const ov=d.querySelector('.ov');if(!ov)return;ov.innerHTML='';
+  (ann[d.dataset.n]||[]).forEach((a,i)=>{
+    const e=document.createElement('div');e.className=a.k;
+    if(a.k=='h')Object.assign(e.style,{left:a.x*100+'%',top:a.y*100+'%',width:a.w*100+'%',height:a.h*100+'%'});
+    else{e.style.left=a.x*100+'%';e.style.top=a.y*100+'%';e.textContent=a.s}
+    e.onclick=ev=>{if(tool!='er')return;ev.stopPropagation();ann[d.dataset.n].splice(i,1);draw(d);save()};
+    ov.append(e);
+  });
+}
+function bind(d,ov,n){
+  let st,el;
+  const pos=e=>{const r=ov.getBoundingClientRect();return[(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]};
+  ov.onpointerdown=e=>{
+    if(tool=='tx'&&e.target==ov){const[x,y]=pos(e),s=prompt('Nội dung:');
+      if(s){(ann[n]??=[]).push({k:'t',x,y,s});draw(d);save()}return}
+    if(tool!='hl')return;
+    st=pos(e);el=document.createElement('div');el.className='h';ov.append(el);ov.setPointerCapture(e.pointerId);
+  };
+  ov.onpointermove=e=>{if(!st)return;const[x,y]=pos(e);
+    Object.assign(el.style,{left:Math.min(st[0],x)*100+'%',top:Math.min(st[1],y)*100+'%',width:Math.abs(x-st[0])*100+'%',height:Math.abs(y-st[1])*100+'%'})};
+  ov.onpointerup=e=>{if(!st)return;const[x,y]=pos(e);
+    const a={k:'h',x:Math.min(st[0],x),y:Math.min(st[1],y),w:Math.abs(x-st[0]),h:Math.abs(y-st[1])};
+    st=null;if(a.w>.005&&a.h>.003)(ann[n]??=[]).push(a);draw(d);save()};
+}
+
+// ---- Lưu & đồng bộ lên Drive (tự động sau 2 giây) ----
+function save(){
+  t0=Date.now();localStorage['a'+book.id]=JSON.stringify({d:ann,t:t0});
+  $('#st').textContent='Đang lưu…';clearTimeout(timer);timer=setTimeout(flush,2000);
+}
+async function flush(){
+  if(!book||!timer)return;clearTimeout(timer);timer=0;
+  const content=JSON.stringify({t:t0,d:ann});
+  try{
+    if(annId)await api(`${U}/files/${annId}?uploadType=media`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:content});
+    else{
+      const meta={name:book.id+'.ann.json',parents:[await folder()],mimeType:'application/json'};
+      const body=`--xx\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(meta)}\r\n--xx\r\nContent-Type: application/json\r\n\r\n${content}\r\n--xx--`;
+      const j=await(await api(`${U}/files?uploadType=multipart`,{method:'POST',headers:{'Content-Type':'multipart/related; boundary=xx'},body})).json();
+      annId=j.id;localStorage['i'+book.id]=annId;
+    }
+    $('#st').textContent='Đã lưu ✓';
+  }catch(e){$('#st').textContent='Lỗi lưu (đã giữ trong máy)'}
+}
+addEventListener('visibilitychange',()=>{if(document.hidden)flush()});
+</script></body></html>
