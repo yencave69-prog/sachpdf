@@ -89,12 +89,13 @@ body.er .h,body.er .t{outline:2px dashed red;cursor:pointer}
   <div class="dh"><b>Mục lục của tôi</b><button class="p" onclick="addToc()">+ Thêm</button></div>
   <div id="toc2"></div>
 </div>
-<button id="relog" class="p" hidden style="position:fixed;left:50%;top:40%;transform:translateX(-50%);z-index:99;padding:14px 20px">Phiên đăng nhập hết hạn, bấm để tiếp tục</button>
 <div id="busy" hidden></div>
 
 <script>
 // ====== ĐIỀN CLIENT ID CỦA BẠN ======
 const CLIENT_ID='265300898548-a5eihfb4qgvo9bop72o68ec285rabopq.apps.googleusercontent.com';
+// Dán địa chỉ Cloudflare Worker của bạn vào đây (không có dấu / ở cuối)
+const WORKER='https://TEN-WORKER.TEN-SUBDOMAIN.workers.dev';
 // ====================================
 const D='https://www.googleapis.com/drive/v3',U='https://www.googleapis.com/upload/drive/v3';
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -106,35 +107,46 @@ let tc,token=null,exp=0,book,pdf,ann={},toc=[],t0=0,annId=null,timer;
 let tool='view',hlc=PAL[0],fmt={z:2.2,c:'#dd0000',b:0,i:0},sel=null,selN=0,cur=1;
 const busy=t=>{$('#busy').hidden=!t;$('#busy').textContent=t||''};
 
-// ---- Đăng nhập Google ----
+// ---- Đăng nhập Google (qua Cloudflare Worker, giữ đăng nhập lâu dài) ----
 try{const s=JSON.parse(localStorage.tk||'null');if(s&&s.e>Date.now()+60000){token=s.t;exp=s.e}}catch(e){}
-function setTok(r){token=r.access_token;exp=Date.now()+r.expires_in*1000;localStorage.hasAuth=1;localStorage.tk=JSON.stringify({t:token,e:exp})}
-function tok(prompt=''){return new Promise((res,rej)=>{
-  if(token&&Date.now()<exp-60000)return res(token);
-  if(!tc)return rej({error:'not_ready'});
-  tc.callback=r=>{if(r.error)return rej(r);setTok(r);res(token)};
-  tc.error_callback=rej;tc.requestAccessToken({prompt});
-})}
-function relogin(){return new Promise(res=>{
-  const b=$('#relog');b.hidden=false;
-  b.onclick=()=>{tc.callback=r=>{if(r.error)return;setTok(r);b.hidden=true;res()};tc.error_callback=()=>{};tc.requestAccessToken({prompt:''})};
-})}
+function setTok(j){token=j.access_token;exp=Date.now()+j.expires_in*1000;localStorage.tk=JSON.stringify({t:token,e:exp})}
+const post=(path,body)=>fetch(WORKER+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+let rp=null;
+function tok(){
+  if(token&&Date.now()<exp-60000)return Promise.resolve(token);
+  if(rp)return rp;
+  rp=(async()=>{
+    const rt=localStorage.rt;if(!rt)throw{auth:1};
+    const r=await post('/refresh',{refresh_token:rt}),j=await r.json();
+    if(!r.ok){if(j.error==='invalid_grant'){delete localStorage.rt;throw{auth:1}}throw new Error(j.error||'refresh_failed')}
+    setTok(j);return token;
+  })().finally(()=>{rp=null});
+  return rp;
+}
 async function api(u,o={}){
-  let t;try{t=await tok()}catch(e){await relogin();t=await tok()}
+  let t;try{t=await tok()}catch(e){if(e&&e.auth){showAuth();throw new Error('Cần đăng nhập lại')}throw e}
   const r=await fetch(u,{...o,headers:{...o.headers,Authorization:'Bearer '+t}});
-  if(r.status==401){token=null;return api(u,o)}
+  if(r.status==401&&!o._r){token=null;delete localStorage.tk;return api(u,{...o,_r:1})}
   if(!r.ok)throw new Error(await r.text());return r;
 }
-async function login(){
-  try{await tok(localStorage.hasAuth?'':'select_account');enter()}catch(e){$('#msg').textContent='Đăng nhập thất bại: '+(e.error||e.type||e.message)}
-}
-function logout(){token=null;exp=0;delete localStorage.hasAuth;delete localStorage.tk;delete localStorage.fid;$('#lib').hidden=true;$('#auth').hidden=false}
+function showAuth(){$('#lib').hidden=true;$('#rd').hidden=true;$('#auth').hidden=false}
+let cc;
+function login(){if(!cc)return $('#msg').textContent='Đang tải Google, thử lại sau vài giây…';cc.requestCode()}
+function logout(){token=null;exp=0;['rt','tk','fid'].forEach(k=>delete localStorage[k]);showAuth()}
 function enter(){$('#auth').hidden=true;$('#lib').hidden=false;list()}
 addEventListener('load',()=>{
-  if(token&&Date.now()<exp-60000)enter();
+  if(localStorage.rt)enter();
   const w=setInterval(()=>{if(!window.google?.accounts)return;clearInterval(w);
-    tc=google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/drive.file',callback:()=>{}});
-    if(localStorage.hasAuth&&!(token&&Date.now()<exp-60000))tok('none').then(enter).catch(()=>{});
+    cc=google.accounts.oauth2.initCodeClient({client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/drive.file',ux_mode:'popup',
+      callback:async r=>{
+        if(r.error)return $('#msg').textContent='Đăng nhập thất bại: '+r.error;
+        try{
+          const x=await post('/exchange',{code:r.code}),j=await x.json();
+          if(!x.ok)return $('#msg').textContent='Lỗi: '+(j.error_description||j.error);
+          if(!j.refresh_token)return $('#msg').textContent='Google không cấp quyền dài hạn. Hãy vào myaccount.google.com/permissions, xóa quyền của "PDF Library", rồi đăng nhập lại.';
+          localStorage.rt=j.refresh_token;setTok(j);enter();
+        }catch(e){$('#msg').textContent='Không kết nối được Worker: '+e.message}
+      }});
   },100);
 });
 
