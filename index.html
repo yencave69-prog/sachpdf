@@ -63,6 +63,7 @@ body.er .h,body.er .t{outline:2px dashed red;cursor:pointer}
   <div id="bar">
     <button onclick="closeBook()">←</button>
     <button onclick="drw.hidden=!drw.hidden">☰ Mục lục</button>
+    <button onclick="dl(book)" title="Tải sách về máy">⬇ Tải về</button>
     <button data-t="view" class="on">Xem</button>
     <button data-t="hl">Highlight</button>
     <button data-t="tx">Chèn chữ</button>
@@ -97,7 +98,9 @@ const CLIENT_ID='265300898548-a5eihfb4qgvo9bop72o68ec285rabopq.apps.googleuserco
 const D='https://www.googleapis.com/drive/v3',U='https://www.googleapis.com/upload/drive/v3';
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 const $=s=>document.querySelector(s);
-const PAL=['#ffe600','#7cfc00','#ff7eb6','#4db8ff','#ff9f1c'];
+const PAL=['#ffe600','#7cfc00','#ff7eb6','#4db8ff','#ff9f1c','#ff3b30'];
+let hlCancel=null;
+addEventListener('keydown',e=>{if(e.key=='Escape'&&hlCancel)hlCancel()});
 let tc,token=null,exp=0,book,pdf,ann={},toc=[],t0=0,annId=null,timer;
 let tool='view',hlc=PAL[0],fmt={z:2.2,c:'#dd0000',b:0,i:0},sel=null,selN=0,cur=1;
 const busy=t=>{$('#busy').hidden=!t;$('#busy').textContent=t||''};
@@ -144,10 +147,11 @@ async function list(){
     $('#list').innerHTML=j.files.length?'':'<p>Chưa có sách nào. Bấm “Tải PDF lên”.</p>';
     j.files.forEach(b=>{
       const d=document.createElement('div');d.className='book';
-      d.innerHTML='<span></span><small></small><button>🗑</button>';
+      d.innerHTML='<span></span><small></small><button title="Tải về máy">⬇</button><button title="Xóa">🗑</button>';
       d.children[0].textContent=b.name.replace(/\.pdf$/i,'');d.children[0].onclick=()=>openBook(b);
       d.children[1].textContent=(b.size/1048576).toFixed(1)+' MB';
-      d.children[2].onclick=async()=>{if(!confirm('Xóa sách này khỏi Drive?'))return;
+      d.children[2].onclick=()=>dl(b);
+      d.children[3].onclick=async()=>{if(!confirm('Xóa sách này khỏi Drive?'))return;
         await api(`${D}/files/${b.id}`,{method:'DELETE'});list()};
       $('#list').append(d);
     });
@@ -177,6 +181,15 @@ async function getBuf(b){
   if(!r){busy('Đang tải sách về máy (lần đầu)…');
     r=await api(`${D}/files/${b.id}?alt=media`);await c.put(k,r.clone())}
   return r.arrayBuffer();
+}
+async function dl(b){
+  try{
+    const buf=await getBuf(b);busy('Đang tạo file…');
+    const u=URL.createObjectURL(new Blob([buf],{type:'application/pdf'}));
+    const a=document.createElement('a');a.href=u;a.download=/\.pdf$/i.test(b.name)?b.name:b.name+'.pdf';
+    document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000);
+  }catch(e){alert('Không tải được: '+e.message)}
+  busy();
 }
 async function openBook(b){
   book=b;sel=null;$('#lib').hidden=true;$('#rd').hidden=false;$('#pages').innerHTML='';$('#st').textContent='Đang mở…';
@@ -270,9 +283,10 @@ PAL.forEach(c=>{const b=document.createElement('button');b.className='dot'+(c==h
   $('#colors').append(b)});
 const cu=document.createElement('input');cu.type='color';cu.value='#ffe600';cu.title='Màu khác';
 cu.oninput=()=>{hlc=cu.value;document.querySelectorAll('#colors .dot').forEach(x=>x.classList.remove('on'))};$('#colors').append(cu);
+const hn=document.createElement('small');hn.textContent='Chuột: bấm 1 lần, di chuột, bấm lần nữa để tô xong (Esc: hủy)';$('#colors').append(hn);
 
 document.querySelectorAll('#bar [data-t]').forEach(b=>b.onclick=()=>{
-  tool=b.dataset.t;document.body.className=tool=='view'?'':tool;
+  if(hlCancel)hlCancel();tool=b.dataset.t;document.body.className=tool=='view'?'':tool;
   if(tool!='mv'){sel=null;document.querySelectorAll('.t.sel').forEach(x=>x.classList.remove('sel'))}
   document.querySelectorAll('#bar [data-t]').forEach(x=>x.classList.toggle('on',x==b));
 });
@@ -328,13 +342,20 @@ function bind(d,ov,n){
     if(tool=='tx'&&e.target==ov){const[x,y]=pos(e),s=prompt('Nội dung:');
       if(s){(ann[n]??=[]).push({k:'t',x,y,s,...fmt});draw(d);save()}return}
     if(tool!='hl')return;
-    st=pos(e);el=document.createElement('div');el.className='h';el.style.background=hlc;ov.append(el);ov.setPointerCapture(e.pointerId);
+    if(st){end(e);return}
+    if(hlCancel)hlCancel();
+    st=pos(e);moved=false;el=document.createElement('div');el.className='h';el.style.background=hlc;ov.append(el);
+    ov.setPointerCapture(e.pointerId);hlCancel=cancel;
   };
-  ov.onpointermove=e=>{if(!st)return;const[x,y]=pos(e);
-    Object.assign(el.style,{left:Math.min(st[0],x)*100+'%',top:Math.min(st[1],y)*100+'%',width:Math.abs(x-st[0])*100+'%',height:Math.abs(y-st[1])*100+'%'})};
-  ov.onpointerup=e=>{if(!st)return;const[x,y]=pos(e);
+  const end=e=>{const[x,y]=pos(e);
     const a={k:'h',x:Math.min(st[0],x),y:Math.min(st[1],y),w:Math.abs(x-st[0]),h:Math.abs(y-st[1]),c:hlc};
-    st=null;if(a.w>.005&&a.h>.003)(ann[n]??=[]).push(a);draw(d);save()};
+    st=null;hlCancel=null;if(a.w>.005&&a.h>.003)(ann[n]??=[]).push(a);draw(d);save()};
+  const cancel=()=>{if(st){st=null;el&&el.remove()}hlCancel=null};
+  ov.onpointermove=e=>{if(!st)return;const[x,y]=pos(e);
+    if(Math.abs(x-st[0])>.01||Math.abs(y-st[1])>.005)moved=true;
+    Object.assign(el.style,{left:Math.min(st[0],x)*100+'%',top:Math.min(st[1],y)*100+'%',width:Math.abs(x-st[0])*100+'%',height:Math.abs(y-st[1])*100+'%'})};
+  // chuột: bấm 1 lần để bắt đầu, di chuột, bấm lần nữa để kết thúc (kéo-thả kiểu cũ vẫn dùng được); cảm ứng: kéo như cũ
+  ov.onpointerup=e=>{if(st&&(moved||e.pointerType!='mouse'))end(e)};
 }
 
 // ---- Lưu & đồng bộ ----
